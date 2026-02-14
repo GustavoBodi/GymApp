@@ -9,6 +9,7 @@ import { WorkoutSummary } from './components/WorkoutSummary';
 import { supabase } from './lib/supabase';
 import { api } from './lib/api';
 import { Toaster } from './components/ui/sonner';
+import { AnimatePresence, motion } from 'motion/react';
 
 type Screen = 
   | 'auth'
@@ -41,29 +42,57 @@ export default function App() {
   const lastOnboardingToken = useRef<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     // Listen for auth state changes (handles initial session, login and token refresh)
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
       console.log('Auth state change:', event, 'Has session:', !!session);
+      if (cancelled) return;
 
       if ((event === 'INITIAL_SESSION' || event === 'SIGNED_IN') && session?.access_token) {
         setAccessToken(session.access_token);
         await handleOnboardingCheck(session.access_token);
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       } else if (event === 'TOKEN_REFRESHED' && session?.access_token) {
         console.log('Token refreshed successfully');
         setAccessToken(session.access_token);
       } else if (event === 'INITIAL_SESSION' && !session) {
         setAccessToken(null);
         setScreen('auth');
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       } else if (event === 'SIGNED_OUT') {
         setAccessToken(null);
         setScreen('auth');
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     });
 
+    // Fallback for browsers/environments where INITIAL_SESSION event can be flaky.
+    supabase.auth.getSession()
+      .then(async ({ data }) => {
+        if (cancelled) return;
+        const token = data.session?.access_token;
+        if (token) {
+          setAccessToken(token);
+          await handleOnboardingCheck(token);
+        } else {
+          setScreen('auth');
+        }
+      })
+      .catch((error) => {
+        console.error('Initial session check error:', error);
+        if (!cancelled) {
+          setScreen('auth');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      });
+
     return () => {
+      cancelled = true;
       subscription.unsubscribe();
     };
   }, []);
@@ -180,6 +209,84 @@ export default function App() {
     setScreen('dashboard');
   };
 
+  const handleAuthSuccess = async (token: string) => {
+    setAccessToken(token);
+    await handleOnboardingCheck(token);
+    setLoading(false);
+  };
+
+  const renderCurrentScreen = () => {
+    if (screen === 'auth') {
+      return <AuthScreen onAuthSuccess={handleAuthSuccess} />;
+    }
+
+    if (screen === 'user-info' && accessToken) {
+      return (
+        <UserInfoScreen
+          accessToken={accessToken}
+          onComplete={handleUserInfoComplete}
+        />
+      );
+    }
+
+    if (screen === 'workout-setup' && accessToken) {
+      return (
+        <WorkoutPlanSetup
+          accessToken={accessToken}
+          onComplete={handleWorkoutSetupComplete}
+        />
+      );
+    }
+
+    if (screen === 'dashboard' && accessToken) {
+      return (
+        <Dashboard
+          accessToken={accessToken}
+          onStartWorkout={handleStartWorkout}
+          onViewWorkout={handleViewWorkout}
+          onLogout={resetToAuth}
+        />
+      );
+    }
+
+    if (screen === 'workout-preview' && accessToken && selectedWorkout) {
+      return (
+        <WorkoutPreview
+          accessToken={accessToken}
+          workout={selectedWorkout}
+          isCompletedToday={selectedWorkoutCompletedToday}
+          onStart={(updatedWorkout) => {
+            setSelectedWorkout(updatedWorkout);
+            setScreen('active-workout');
+          }}
+          onBack={handleBackToDashboard}
+        />
+      );
+    }
+
+    if (screen === 'active-workout' && accessToken && selectedWorkout) {
+      return (
+        <ActiveWorkout
+          accessToken={accessToken}
+          workout={selectedWorkout}
+          onComplete={handleWorkoutComplete}
+          onBack={handleBackToDashboard}
+        />
+      );
+    }
+
+    if (screen === 'workout-summary' && workoutSummary) {
+      return (
+        <WorkoutSummary
+          summary={workoutSummary}
+          onBackToDashboard={handleBackToDashboard}
+        />
+      );
+    }
+
+    return null;
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-white">
@@ -190,58 +297,18 @@ export default function App() {
 
   return (
     <>
-      {screen === 'auth' && (
-        <AuthScreen />
-      )}
-
-      {screen === 'user-info' && accessToken && (
-        <UserInfoScreen
-          accessToken={accessToken}
-          onComplete={handleUserInfoComplete}
-        />
-      )}
-
-      {screen === 'workout-setup' && accessToken && (
-        <WorkoutPlanSetup
-          accessToken={accessToken}
-          onComplete={handleWorkoutSetupComplete}
-        />
-      )}
-
-      {screen === 'dashboard' && accessToken && (
-        <Dashboard
-          accessToken={accessToken}
-          onStartWorkout={handleStartWorkout}
-          onViewWorkout={handleViewWorkout}
-          onLogout={resetToAuth}
-        />
-      )}
-
-      {screen === 'workout-preview' && accessToken && selectedWorkout && (
-        <WorkoutPreview
-          accessToken={accessToken}
-          workout={selectedWorkout}
-          isCompletedToday={selectedWorkoutCompletedToday}
-          onStart={() => setScreen('active-workout')}
-          onBack={handleBackToDashboard}
-        />
-      )}
-
-      {screen === 'active-workout' && accessToken && selectedWorkout && (
-        <ActiveWorkout
-          accessToken={accessToken}
-          workout={selectedWorkout}
-          onComplete={handleWorkoutComplete}
-          onBack={handleBackToDashboard}
-        />
-      )}
-
-      {screen === 'workout-summary' && workoutSummary && (
-        <WorkoutSummary
-          summary={workoutSummary}
-          onBackToDashboard={handleBackToDashboard}
-        />
-      )}
+      <AnimatePresence mode="wait" initial={false}>
+        <motion.div
+          key={`${screen}-${selectedWorkout?.day ?? 'none'}-${workoutSummary ? 'summary' : 'nosummary'}`}
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -6 }}
+          transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+          className="w-full"
+        >
+          {renderCurrentScreen()}
+        </motion.div>
+      </AnimatePresence>
 
       <Toaster />
     </>

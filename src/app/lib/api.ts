@@ -71,6 +71,31 @@ export const api = {
     return authorizedFetch("/user-info", accessToken);
   },
 
+  async getUserInfoHistory(accessToken: string) {
+    return authorizedFetch("/user-info-history", accessToken);
+  },
+
+  async updateUserInfoHistory(
+    accessToken: string,
+    entryId: string,
+    weight: number,
+    height: number,
+    age: number,
+    bodyFat?: number,
+  ) {
+    return authorizedFetch(
+      `/user-info-history/${encodeURIComponent(entryId)}`,
+      accessToken,
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ weight, height, age, bodyFat }),
+      },
+    );
+  },
+
   async saveWorkoutPlan(accessToken: string, workoutPlan: any) {
     return authorizedFetch("/workout-plan", accessToken, {
       method: "POST",

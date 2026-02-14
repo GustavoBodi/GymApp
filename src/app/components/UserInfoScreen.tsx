@@ -11,19 +11,41 @@ interface UserInfoScreenProps {
   isUpdating?: boolean;
 }
 
+interface UserInfoHistoryEntry {
+  entryId: string;
+  weight: number;
+  height: number;
+  age: number;
+  bodyFat: number | null;
+  recordedAt: string;
+  updatedAt: string;
+}
+
 export function UserInfoScreen({ accessToken, onComplete, isUpdating = false }: UserInfoScreenProps) {
   const [weight, setWeight] = useState('');
   const [height, setHeight] = useState('');
   const [age, setAge] = useState('');
   const [bodyFat, setBodyFat] = useState('');
+  const [history, setHistory] = useState<UserInfoHistoryEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
+  const [editWeight, setEditWeight] = useState('');
+  const [editHeight, setEditHeight] = useState('');
+  const [editAge, setEditAge] = useState('');
+  const [editBodyFat, setEditBodyFat] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [successMessage, setSuccessMessage] = useState('');
 
   useEffect(() => {
     if (isUpdating) {
-      loadUserInfo();
+      loadUpdateData();
     }
-  }, [isUpdating]);
+  }, [isUpdating, accessToken]);
+
+  const loadUpdateData = async () => {
+    await Promise.all([loadUserInfo(), loadHistory()]);
+  };
 
   const loadUserInfo = async () => {
     try {
@@ -39,9 +61,69 @@ export function UserInfoScreen({ accessToken, onComplete, isUpdating = false }: 
     }
   };
 
+  const loadHistory = async () => {
+    setHistoryLoading(true);
+    try {
+      const result = await api.getUserInfoHistory(accessToken);
+      const historyData = Array.isArray(result.history) ? result.history : [];
+      setHistory(historyData);
+    } catch (err) {
+      console.error('Load user info history error:', err);
+      setHistory([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const startEditEntry = (entry: UserInfoHistoryEntry) => {
+    setEditingEntryId(entry.entryId);
+    setEditWeight(entry.weight.toString());
+    setEditHeight(entry.height.toString());
+    setEditAge(entry.age.toString());
+    setEditBodyFat(entry.bodyFat?.toString() || '');
+    setError('');
+    setSuccessMessage('');
+  };
+
+  const cancelEditEntry = () => {
+    setEditingEntryId(null);
+    setEditWeight('');
+    setEditHeight('');
+    setEditAge('');
+    setEditBodyFat('');
+  };
+
+  const handleSaveEntryFix = async (entryId: string) => {
+    setError('');
+    setSuccessMessage('');
+
+    try {
+      const result = await api.updateUserInfoHistory(
+        accessToken,
+        entryId,
+        parseFloat(editWeight),
+        parseFloat(editHeight),
+        parseInt(editAge),
+        editBodyFat ? parseFloat(editBodyFat) : undefined,
+      );
+
+      if (result.error) {
+        throw new Error(result.error);
+      }
+
+      cancelEditEntry();
+      setSuccessMessage('History entry updated.');
+      await loadUpdateData();
+    } catch (err: any) {
+      console.error('Update history entry error:', err);
+      setError(err.message || 'Failed to update history entry');
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setSuccessMessage('');
     setLoading(true);
 
     try {
@@ -57,7 +139,12 @@ export function UserInfoScreen({ accessToken, onComplete, isUpdating = false }: 
         throw new Error(result.error);
       }
 
-      onComplete();
+      if (isUpdating) {
+        setSuccessMessage('New metrics snapshot saved.');
+        await loadUpdateData();
+      } else {
+        onComplete();
+      }
     } catch (err: any) {
       console.error('Save user info error:', err);
       setError(err.message || 'Failed to save information');
@@ -147,6 +234,12 @@ export function UserInfoScreen({ accessToken, onComplete, isUpdating = false }: 
             </div>
           </div>
 
+          {successMessage && (
+            <div className="text-sm text-primary text-center">
+              {successMessage}
+            </div>
+          )}
+
           {error && (
             <div className="text-sm text-destructive text-center">
               {error}
@@ -158,9 +251,123 @@ export function UserInfoScreen({ accessToken, onComplete, isUpdating = false }: 
             className="w-full"
             disabled={loading}
           >
-            {loading ? 'Saving...' : isUpdating ? 'Update' : 'Continue'}
+            {loading ? 'Saving...' : isUpdating ? 'Save New Snapshot' : 'Continue'}
           </Button>
         </form>
+
+        {isUpdating && (
+          <div className="space-y-4">
+            <div>
+              <h3 className="text-lg font-medium">Body Metrics History</h3>
+              <p className="text-sm text-muted-foreground mt-1">
+                Every update creates a new snapshot. Use "Fix entry" to correct old data.
+              </p>
+            </div>
+
+            {historyLoading ? (
+              <div className="text-sm text-muted-foreground">Loading history...</div>
+            ) : history.length === 0 ? (
+              <div className="text-sm text-muted-foreground">No history entries yet.</div>
+            ) : (
+              <div className="space-y-3 max-h-96 overflow-auto pr-1">
+                {history.map((entry, index) => {
+                  const isEditing = editingEntryId === entry.entryId;
+                  return (
+                    <div key={entry.entryId} className="border border-border rounded-xl p-4 space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="font-medium">
+                            {new Date(entry.recordedAt).toLocaleDateString()} {new Date(entry.recordedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </div>
+                          <div className="text-xs text-muted-foreground">
+                            Last corrected: {new Date(entry.updatedAt).toLocaleString()}
+                          </div>
+                        </div>
+                        {index === 0 && (
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-primary text-primary-foreground">
+                            Latest
+                          </span>
+                        )}
+                      </div>
+
+                      {!isEditing ? (
+                        <>
+                          <div className="grid grid-cols-2 gap-2 text-sm text-muted-foreground">
+                            <div>Weight: <span className="text-foreground font-medium">{entry.weight} kg</span></div>
+                            <div>Height: <span className="text-foreground font-medium">{entry.height} cm</span></div>
+                            <div>Age: <span className="text-foreground font-medium">{entry.age}</span></div>
+                            <div>Body Fat: <span className="text-foreground font-medium">{entry.bodyFat ?? '-'}{entry.bodyFat !== null ? '%' : ''}</span></div>
+                          </div>
+                          <Button type="button" variant="outline" onClick={() => startEditEntry(entry)}>
+                            Fix entry
+                          </Button>
+                        </>
+                      ) : (
+                        <div className="space-y-3">
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <Label htmlFor={`edit-weight-${entry.entryId}`}>Weight (kg)</Label>
+                              <Input
+                                id={`edit-weight-${entry.entryId}`}
+                                type="number"
+                                step="0.1"
+                                value={editWeight}
+                                onChange={(e) => setEditWeight(e.target.value)}
+                                className="mt-1"
+                              />
+                            </div>
+                            <div>
+                              <Label htmlFor={`edit-height-${entry.entryId}`}>Height (cm)</Label>
+                              <Input
+                                id={`edit-height-${entry.entryId}`}
+                                type="number"
+                                step="0.1"
+                                value={editHeight}
+                                onChange={(e) => setEditHeight(e.target.value)}
+                                className="mt-1"
+                              />
+                            </div>
+                            <div>
+                              <Label htmlFor={`edit-age-${entry.entryId}`}>Age</Label>
+                              <Input
+                                id={`edit-age-${entry.entryId}`}
+                                type="number"
+                                value={editAge}
+                                onChange={(e) => setEditAge(e.target.value)}
+                                className="mt-1"
+                              />
+                            </div>
+                            <div>
+                              <Label htmlFor={`edit-body-fat-${entry.entryId}`}>Body Fat %</Label>
+                              <Input
+                                id={`edit-body-fat-${entry.entryId}`}
+                                type="number"
+                                step="0.1"
+                                min="0"
+                                max="100"
+                                value={editBodyFat}
+                                onChange={(e) => setEditBodyFat(e.target.value)}
+                                className="mt-1"
+                              />
+                            </div>
+                          </div>
+                          <div className="flex gap-2">
+                            <Button type="button" onClick={() => handleSaveEntryFix(entry.entryId)}>
+                              Save Fix
+                            </Button>
+                            <Button type="button" variant="outline" onClick={cancelEditEntry}>
+                              Cancel
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

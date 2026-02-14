@@ -7,7 +7,11 @@ import { supabase } from '../lib/supabase';
 
 type AuthMode = 'login' | 'signup' | 'reset-password' | 'check-email';
 
-export function AuthScreen() {
+interface AuthScreenProps {
+  onAuthSuccess?: (accessToken: string) => Promise<void> | void;
+}
+
+export function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
   const [mode, setMode] = useState<AuthMode>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -31,6 +35,9 @@ export function AuthScreen() {
         });
 
         if (error) throw error;
+        if (data.session?.access_token) {
+          await onAuthSuccess?.(data.session.access_token);
+        }
       } else if (mode === 'signup') {
         // Sign up with Supabase
         const { data, error } = await supabase.auth.signUp({
@@ -44,7 +51,9 @@ export function AuthScreen() {
         });
 
         if (error) throw error;
-        if (!data.session?.access_token) {
+        if (data.session?.access_token) {
+          await onAuthSuccess?.(data.session.access_token);
+        } else {
           // If no session, email confirmation might be required
           setMessage('Account created! You can now sign in.');
           setMode('login');

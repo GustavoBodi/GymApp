@@ -4,6 +4,8 @@ import * as kv from "./kv_store.ts";
 const BASE_PATH = "/make-server-aa3c5c88";
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const anonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
+const authClientKey = serviceRoleKey || anonKey;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -12,7 +14,16 @@ const corsHeaders = {
     "Content-Type, Authorization, apikey, x-client-info",
 };
 
-const supabase = createClient(supabaseUrl, serviceRoleKey);
+const supabase = createClient(supabaseUrl, authClientKey);
+
+const getProjectRefFromUrl = (url: string) => {
+  try {
+    const hostname = new URL(url).hostname;
+    return hostname.split(".")[0] ?? "";
+  } catch {
+    return "";
+  }
+};
 
 const getErrorMessage = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
@@ -43,6 +54,22 @@ const parseJwtPayload = (token: string) => {
 };
 
 const getAuthenticatedUser = async (req: Request) => {
+  if (!supabaseUrl || !authClientKey) {
+    return {
+      user: null,
+      status: 500,
+      error:
+        "Function auth client is not configured. Missing SUPABASE_URL and/or SUPABASE_ANON_KEY/SUPABASE_SERVICE_ROLE_KEY.",
+      code: "missing_supabase_env",
+      claims: null,
+      debug: {
+        hasSupabaseUrl: Boolean(supabaseUrl),
+        hasServiceRoleKey: Boolean(serviceRoleKey),
+        hasAnonKey: Boolean(anonKey),
+      },
+    };
+  }
+
   const authorizationHeader = req.headers.get("Authorization");
 
   if (!authorizationHeader || !authorizationHeader.startsWith("Bearer ")) {
@@ -76,11 +103,165 @@ const getAuthenticatedUser = async (req: Request) => {
             role: claims.role,
           }
         : null,
+      debug: {
+        projectRefFromUrl: getProjectRefFromUrl(supabaseUrl),
+        authClientKeyType: serviceRoleKey ? "service_role" : "anon",
+      },
     };
   }
 
   return { user, status: 200, error: null, code: null, claims: null };
 };
+
+type UserInfoSnapshot = {
+  weight: number;
+  height: number;
+  age: number;
+  bodyFat: number | null;
+};
+
+type UserInfoHistoryEntry = UserInfoSnapshot & {
+  entryId: string;
+  recordedAt: string;
+  updatedAt: string;
+};
+
+const userInfoLatestKey = (userId: string) => `user_info_${userId}`;
+const userInfoHistoryPrefix = (userId: string) => `user_info_history:${userId}:`;
+const userInfoHistoryKey = (userId: string, entryId: string) =>
+  `${userInfoHistoryPrefix(userId)}${entryId}`;
+
+const parseUserInfoPayload = (
+  payload: Record<string, unknown>,
+): { data: UserInfoSnapshot | null; error: string | null } => {
+  const weight = Number(payload.weight);
+  const height = Number(payload.height);
+  const age = Number(payload.age);
+
+  if (!Number.isFinite(weight) || weight <= 0) {
+    return { data: null, error: "Invalid weight" };
+  }
+
+  if (!Number.isFinite(height) || height <= 0) {
+    return { data: null, error: "Invalid height" };
+  }
+
+  if (!Number.isFinite(age) || age <= 0) {
+    return { data: null, error: "Invalid age" };
+  }
+
+  const bodyFatRaw = payload.bodyFat;
+  let bodyFat: number | null = null;
+
+  if (bodyFatRaw !== undefined && bodyFatRaw !== null && bodyFatRaw !== "") {
+    const parsedBodyFat = Number(bodyFatRaw);
+    if (
+      !Number.isFinite(parsedBodyFat) ||
+      parsedBodyFat < 0 ||
+      parsedBodyFat > 100
+    ) {
+      return { data: null, error: "Invalid body fat percentage" };
+    }
+    bodyFat = parsedBodyFat;
+  }
+
+  return {
+    data: {
+      weight,
+      height,
+      age: Math.round(age),
+      bodyFat,
+    },
+    error: null,
+  };
+};
+
+const asHistoryEntry = (
+  value: unknown,
+): UserInfoHistoryEntry | null => {
+  if (typeof value !== "object" || value === null) return null;
+  const entry = value as Partial<UserInfoHistoryEntry>;
+
+  if (
+    typeof entry.entryId !== "string" ||
+    typeof entry.recordedAt !== "string" ||
+    typeof entry.updatedAt !== "string" ||
+    typeof entry.weight !== "number" ||
+    typeof entry.height !== "number" ||
+    typeof entry.age !== "number"
+  ) {
+    return null;
+  }
+
+  return {
+    entryId: entry.entryId,
+    recordedAt: entry.recordedAt,
+    updatedAt: entry.updatedAt,
+    weight: entry.weight,
+    height: entry.height,
+    age: entry.age,
+    bodyFat:
+      typeof entry.bodyFat === "number" ? entry.bodyFat : null,
+  };
+};
+
+const sortHistoryDesc = (entries: UserInfoHistoryEntry[]) =>
+  [...entries].sort(
+    (a, b) =>
+      new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime(),
+  );
+
+const ensureUserInfoHistory = async (
+  userId: string,
+): Promise<UserInfoHistoryEntry[]> => {
+  const historyRaw = await kv.getByPrefix(userInfoHistoryPrefix(userId));
+  const parsedHistory = historyRaw
+    .map((item) => asHistoryEntry(item))
+    .filter((item): item is UserInfoHistoryEntry => Boolean(item));
+
+  if (parsedHistory.length > 0) {
+    return sortHistoryDesc(parsedHistory);
+  }
+
+  const latest = await kv.get(userInfoLatestKey(userId));
+  if (!latest) {
+    return [];
+  }
+
+  const now = new Date().toISOString();
+  const latestObj = latest as Record<string, unknown>;
+  const snapshotParse = parseUserInfoPayload({
+    weight: latestObj.weight,
+    height: latestObj.height,
+    age: latestObj.age,
+    bodyFat: latestObj.bodyFat ?? null,
+  });
+
+  if (!snapshotParse.data) {
+    return [];
+  }
+
+  const recordedAt =
+    typeof latestObj.updatedAt === "string" ? latestObj.updatedAt : now;
+  const entryId = `legacy_${Date.now()}`;
+  const legacyEntry: UserInfoHistoryEntry = {
+    entryId,
+    ...snapshotParse.data,
+    recordedAt,
+    updatedAt: recordedAt,
+  };
+
+  await kv.set(userInfoHistoryKey(userId, entryId), legacyEntry);
+  return [legacyEntry];
+};
+
+const latestProfileFromEntry = (entry: UserInfoHistoryEntry) => ({
+  weight: entry.weight,
+  height: entry.height,
+  age: entry.age,
+  bodyFat: entry.bodyFat,
+  updatedAt: entry.updatedAt,
+});
 
 const handleRequest = async (req: Request) => {
   const url = new URL(req.url);
@@ -170,20 +351,26 @@ const handleRequest = async (req: Request) => {
         return jsonResponse({ error: auth.error }, auth.status);
       }
 
-      const { weight, height, age, bodyFat } = await req.json();
+      const parseResult = parseUserInfoPayload(await req.json());
+      if (!parseResult.data) {
+        return jsonResponse({ error: parseResult.error }, 400);
+      }
 
-      const userInfo = {
-        weight,
-        height,
-        age,
-        bodyFat: bodyFat || null,
-        updatedAt: new Date().toISOString(),
+      await ensureUserInfoHistory(auth.user.id);
+      const now = new Date().toISOString();
+      const entryId = `${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+      const historyEntry: UserInfoHistoryEntry = {
+        entryId,
+        ...parseResult.data,
+        recordedAt: now,
+        updatedAt: now,
       };
 
-      await kv.set(`user_info_${auth.user.id}`, userInfo);
+      await kv.set(userInfoHistoryKey(auth.user.id, entryId), historyEntry);
+      await kv.set(userInfoLatestKey(auth.user.id), latestProfileFromEntry(historyEntry));
 
       console.log("User info saved successfully for user:", auth.user.id);
-      return jsonResponse({ success: true });
+      return jsonResponse({ success: true, entry: historyEntry });
     } catch (error) {
       console.log("Save user info error:", error);
       return jsonResponse(
@@ -202,7 +389,16 @@ const handleRequest = async (req: Request) => {
         return jsonResponse({ error: auth.error }, auth.status);
       }
 
-      const profile = await kv.get(`user_info_${auth.user.id}`);
+      let profile = await kv.get(userInfoLatestKey(auth.user.id));
+
+      if (!profile) {
+        const history = await ensureUserInfoHistory(auth.user.id);
+        const latestEntry = sortHistoryDesc(history)[0];
+        if (latestEntry) {
+          profile = latestProfileFromEntry(latestEntry);
+          await kv.set(userInfoLatestKey(auth.user.id), profile);
+        }
+      }
 
       console.log(
         "User info retrieved for user:",
@@ -215,6 +411,71 @@ const handleRequest = async (req: Request) => {
       console.log("Get user info error:", error);
       return jsonResponse(
         { error: `Failed to get user info: ${getErrorMessage(error)}` },
+        500,
+      );
+    }
+  }
+
+  if (pathname === `${BASE_PATH}/user-info-history` && req.method === "GET") {
+    try {
+      const auth = await getAuthenticatedUser(req);
+
+      if (!auth.user?.id) {
+        return jsonResponse({ error: auth.error }, auth.status);
+      }
+
+      const history = await ensureUserInfoHistory(auth.user.id);
+      return jsonResponse({ history: sortHistoryDesc(history) });
+    } catch (error) {
+      console.log("Get user info history error:", error);
+      return jsonResponse(
+        { error: `Failed to get user info history: ${getErrorMessage(error)}` },
+        500,
+      );
+    }
+  }
+
+  const userInfoHistoryMatch = pathname.match(
+    new RegExp(`^${BASE_PATH}/user-info-history/([^/]+)$`),
+  );
+  if (userInfoHistoryMatch && req.method === "PUT") {
+    try {
+      const auth = await getAuthenticatedUser(req);
+
+      if (!auth.user?.id) {
+        return jsonResponse({ error: auth.error }, auth.status);
+      }
+
+      const entryId = decodeURIComponent(userInfoHistoryMatch[1]);
+      const historyKey = userInfoHistoryKey(auth.user.id, entryId);
+      const existing = asHistoryEntry(await kv.get(historyKey));
+
+      if (!existing) {
+        return jsonResponse({ error: "History entry not found" }, 404);
+      }
+
+      const parseResult = parseUserInfoPayload(await req.json());
+      if (!parseResult.data) {
+        return jsonResponse({ error: parseResult.error }, 400);
+      }
+
+      const updatedEntry: UserInfoHistoryEntry = {
+        ...existing,
+        ...parseResult.data,
+        updatedAt: new Date().toISOString(),
+      };
+
+      await kv.set(historyKey, updatedEntry);
+
+      const history = await ensureUserInfoHistory(auth.user.id);
+      const latestEntry = sortHistoryDesc(history)[0] ?? updatedEntry;
+      await kv.set(userInfoLatestKey(auth.user.id), latestProfileFromEntry(latestEntry));
+
+      return jsonResponse({ success: true, entry: updatedEntry });
+    } catch (error) {
+      console.log("Update user info history entry error:", error);
+      return jsonResponse(
+        { error: `Failed to update user info history entry: ${getErrorMessage(error)}` },
         500,
       );
     }
